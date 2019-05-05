@@ -1,81 +1,156 @@
-package main
+package webcache
 
 import (
-	"io/ioutil"
-	"net/http"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
 	"time"
 )
 
+type Value []byte
 
-type entry struct {
-	res result
-	ready chan struct{}
-}
-
-type result struct {
-	value []byte
-	err error
-}
-
-type request struct {
-	url string
-	response chan<- result
+type Cache interface {
+	Get(url string)  (*Response, error)
+	Delete(key string)
+	Set(url string, response *Response)
+	FindEvictionEntries(url string, value Value)([]string, bool)
+	Initialize(key string, value *Response)
+	ExpirationTime() time.Duration
+	PrintCapacity()
 }
 
 type WebCache struct {
-	requests chan request
+	pendingSet int
+	currentCapacity int
+	maxCapacity int
+	expirationTime time.Duration
+	policy      Policy
+	sync.RWMutex
+	cache      map[string]*Entry
+	updateChan chan *Entry
 }
 
-func NewWebCache(policy *Policy, cacheSize uint64, expirationTime uint8) *WebCache {
-	requests := make(chan request)
-	cache := &WebCache{requests: requests}
-	go cache.server(policy, cacheSize, expirationTime)
-	return cache
+
+func NewWebCache(policy Policy, cacheSize int, expirationTime int) Cache {
+
+	c := &WebCache{
+		currentCapacity: 0,
+		pendingSet: 0,
+		maxCapacity: cacheSize*1000000,
+		expirationTime: time.Duration(expirationTime)*time.Second,
+		cache:          make(map[string]*Entry),
+		updateChan:     make(chan *Entry),
+		policy:         policy,
+	}
+
+	return c
 }
 
-func (webcache *WebCache) Get(url string) ([]byte, error) {
-	response := make(chan result)
-	webcache.requests <- request{url, response}
-	res := <- response
-	return res.value, res.err
+func (c *WebCache) ExpirationTime() time.Duration { return c.expirationTime }
+
+func (c *WebCache) Get(url string) (*Response, error) {
+	c.RLock()
+	defer c.RUnlock()
+
+	entry, ok := c.cache[RemoveHTTPPrefix(url)]
+	if !ok {
+		return nil, errors.New(fmt.Sprintf("MISS - %s", url))
+	}
+	if !entry.Expired() {
+		c.promote(entry)
+		//log.Println(fmt.Sprintf("HIT - %s", url))
+		return entry.Response, nil //TODO this response is not being read properly
+	} else {
+		return nil, errors.New(fmt.Sprintf("EXPIRED - %s", url))
+	}
 }
 
-// Serve incoming GET requests
-func (webcache *WebCache) server(policy *Policy, cacheSize uint64, expirationTime uint8) {
-	cache := make(map[string]*entry)
-	for req := range webcache.requests {
-		e := cache[req.url]
-		if e == nil {
-			e = &entry{ready: make(chan struct{})}
-			cache[req.url] = e
-			go e.call(httpMakeRequest, req.url)
+func (c *WebCache) FindEvictionEntries(url string, value Value) (toDelete []string, cache bool) {
+	c.Lock()
+	defer c.Unlock()
+
+	length := len(value)
+
+	if length > c.maxCapacity {
+		log.Println(fmt.Sprintf("Not Caching - Response for %s too large.", url))
+		return toDelete, false
+	} else if (c.maxCapacity - (c.currentCapacity + c.pendingSet)) < length {
+		//log.Println(fmt.Sprintf("Need to make room for %s in the cache. Start evicting.", url))
+		room := c.maxCapacity - (c.currentCapacity + c.pendingSet)
+		for room < length {
+			toEvict := c.policy.Evict()
+			if toEvict == nil {
+				log.Println(fmt.Sprintf("Not Caching - Unable to make room for %s.", url))
+				return toDelete, false
+			}
+			toDelete = append(toDelete, toEvict.Key)
+			room += toEvict.Size
 		}
-		go e.deliver(req.response)
 	}
-
+	c.pendingSet += length
+	return toDelete, true
 }
 
-// Evaluate the function f and broadcast the entry is ready
-func (e *entry) call (f Func, key string) {
-	e.res.value, e.res.err = f(key)
-	close(e.ready)
-}
+func (c *WebCache) Delete(key string) {
+	c.Lock()
+	defer c.Unlock()
 
-// Wait for entry to be ready and send result to client
-func (e *entry) deliver(response chan<- result) {
-	<- e.ready
-	response <- e.res
-}
-
-///////////////
-// Functions
-
-func httpMakeRequest(url string) ([]byte, error) {
-	client := &http.Client{Timeout: time.Second*5,}
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, err
+	if c.cache[key] != nil {
+		size := c.cache[key].Size
+		delete(c.cache, key)
+		c.currentCapacity -= size
+		log.Println(fmt.Sprintf("EVICT - %s", key))
+		c.PrintCapacity()
 	}
-	defer resp.Body.Close()
-	return ioutil.ReadAll(resp.Body)
+}
+
+func (c *WebCache) Set(url string, value *Response) {
+	c.Lock()
+	defer c.Unlock()
+	hash := Hash(url)
+	entry := NewEntry(hash, value)
+
+	//Only add to the cache size if the entry isn't in the cache already
+	if c.cache[hash] == nil {
+		c.currentCapacity += entry.Size
+		c.pendingSet -= entry.Size
+		log.Println(fmt.Sprintf("SET - URL: %s Key: %s", url, hash))
+	} else {
+		log.Println(fmt.Sprintf("UPDATE - URL: %s Key: %s", url, hash))
+		c.pendingSet -= entry.Size
+	}
+	c.cache[hash] = entry
+	c.promote(entry)
+	c.PrintCapacity()
+}
+
+func (c *WebCache) Initialize(key string, value *Response) {
+	log.Println(fmt.Sprintf("Adding disk cache entry to web cache. Key: %s", key))
+	entry := NewEntry(key, value)
+	c.cache[key] = entry
+	c.currentCapacity += entry.Size
+	c.promote(entry)
+}
+
+func (c *WebCache) promote(entry *Entry) {
+	c.policy.Promote(entry)
+}
+
+func (c *WebCache) PrintCapacity() {
+	CacheStatus(c.currentCapacity, c.maxCapacity)
+}
+
+func Hash(key string) string {
+	// First strip prefix
+	url := RemoveHTTPPrefix(key)
+	hash := sha256.New()
+	hash.Write([]byte(url))
+	return fmt.Sprintf("%x", hash.Sum(nil))
+}
+
+func RemoveHTTPPrefix(src string) string {
+	return strings.Trim(src, "http://")
 }

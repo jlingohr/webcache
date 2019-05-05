@@ -1,30 +1,78 @@
-package main
+package webcache
 
 import (
-	"errors"
-	"fmt"
+	"container/heap"
+	"container/list"
+	"log"
 )
 
-const LRU = "LRU"
-const LFU = "LFU"
-
-//TODO figure out parameters
-type Func func(key string) ([]byte, error)
-
-//TODO Figure out parameters
-type Policy struct {
-	f Func
-	expirationTime uint8
+type Policy interface {
+	Promote(entry *Entry)
+	Evict() *Entry //Clear size bytes from cache
 }
 
-func NewPolicy(replacementPolicy string, expirationTime uint8) (policy *Policy, err error) {
-	switch replacementPolicy {
-	case LRU:
-		policy = &Policy{f:nil, expirationTime: expirationTime}
-	case LFU:
-		policy = &Policy{f:nil, expirationTime: expirationTime}
-	default:
-		err = errors.New(fmt.Sprintf("Invalid cache replacement policy [%s]", replacementPolicy))
+type LRUPolicy struct {
+	entries *list.List
+}
+
+func NewLRUPolicy() *LRUPolicy {
+	return &LRUPolicy{list.New()}
+}
+
+
+func (l *LRUPolicy) Promote(entry *Entry)  {
+	if entry.element != nil {
+		l.entries.MoveToFront(entry.element)
+	} else {
+		entry.element = l.entries.PushFront(entry)
 	}
-	return
+}
+
+func (l *LRUPolicy) Evict() *Entry {
+	item := l.entries.Back()
+	if item == nil { return nil }
+	entry := item.Value.(*Entry)
+	l.entries.Remove(item)
+	log.Printf("LRU - evict %s", entry.Key)
+	return entry
+}
+
+// *** Doesn't seem like this is being used?
+//func (l *LRUPolicy) Delete(entry *Entry) {
+//	l.entries.Remove(entry.element)
+//}
+
+/////////////
+// LFU
+
+type LFUPolicy struct {
+	entries *PriorityQueue
+	tick uint64
+}
+
+func NewLFUPolicy() *LFUPolicy {
+	pq := make(PriorityQueue, 0)
+	heap.Init(&pq)
+	return &LFUPolicy{&pq, 0}
+}
+
+
+func (l *LFUPolicy) Promote(entry *Entry)  {
+	l.tick += 1
+	if entry.index < 0 {
+		entry.hits += 1
+		entry.tick = l.tick
+		l.entries.Push(entry)
+	} else {
+		entry.hits += 1
+		entry.tick += 1
+		l.entries.Update(entry)
+	}
+}
+
+func (l *LFUPolicy) Evict() *Entry {
+	//TODO
+	entry := heap.Pop(l.entries).(*Entry)
+	log.Printf("LFU - evict %s. Frequency is %d", entry.Key, entry.hits)
+	return entry
 }
